@@ -16,14 +16,14 @@ describe("pinSelectedTimelineRows", () => {
     );
   });
 
-  it("keeps pins the list already has", () => {
+  it("keeps the pins the list already has, in order and without duplicates", () => {
     expect(
       pinSelectedTimelineRows(
         rows,
-        { anchorRowId: "c", focusRowId: "c" },
-        { indices: [0], keys: ["cited"] },
+        { anchorRowId: "d", focusRowId: "b" },
+        { indices: [4, 2], keys: ["cited"] },
       ),
-    ).toEqual({ indices: [0, 2], keys: ["cited"] });
+    ).toEqual({ indices: [1, 2, 3, 4], keys: ["cited"] });
   });
 
   it("leaves the list's pins alone without a selection or when its rows are gone", () => {

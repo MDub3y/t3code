@@ -7,6 +7,7 @@ export interface TimelineSelectionPin {
   readonly focusRowId: string;
 }
 
+/** The id of the timeline row a selection endpoint sits in, or null outside any row. */
 function timelineRowIdOfNode(node: Node | null): string | null {
   const element = node instanceof Element ? node : (node?.parentElement ?? null);
   return element?.closest<HTMLElement>("[data-timeline-row-id]")?.dataset.timelineRowId ?? null;
@@ -26,12 +27,15 @@ export function pinSelectedTimelineRows(
   const anchorIndex = rows.findIndex((row) => row.id === pin.anchorRowId);
   const focusIndex = rows.findIndex((row) => row.id === pin.focusRowId);
   if (anchorIndex < 0 || focusIndex < 0) return alwaysRender;
-  const start = Math.min(anchorIndex, focusIndex);
-  const indices = Array.from(
-    { length: Math.abs(focusIndex - anchorIndex) + 1 },
-    (_, i) => start + i,
-  );
-  return { ...alwaysRender, indices: [...(alwaysRender?.indices ?? []), ...indices] };
+  const indices = new Set(alwaysRender?.indices);
+  for (
+    let index = Math.min(anchorIndex, focusIndex);
+    index <= Math.max(anchorIndex, focusIndex);
+    index++
+  ) {
+    indices.add(index);
+  }
+  return { ...alwaysRender, indices: [...indices].sort((a, b) => a - b) };
 }
 
 /**
