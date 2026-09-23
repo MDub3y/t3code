@@ -1620,7 +1620,10 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
   useWorkspaceMutationRefresh({
     enabled: resource._tag === "media-file" || resource._tag === "workspace-file",
     mutationId: props.workspaceMutationId ?? null,
-    refresh: refreshAssetUrl,
+    refresh: () => {
+      // A failed re-sign flows through assetUrl, which offers its own retry.
+      void refreshAssetUrl().catch(() => undefined);
+    },
     resourceKey: JSON.stringify([props.environmentId, resource]),
   });
   const path =
