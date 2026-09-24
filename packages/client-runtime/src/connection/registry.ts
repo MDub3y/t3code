@@ -531,23 +531,29 @@ export const make = Effect.gen(function* () {
           // on their own loopback origin, so they authenticate with a bearer
           // token instead of the primary's same-origin cookie. Stash it where
           // the resolver's bearer broker looks it up.
-          let bearerChanged = false;
+          let bearerRefreshed = false;
           if (registration._tag === "BearerConnectionRegistration") {
-            const stored = yield* credentials
+            const previousCredential = yield* credentials
               .get(registration.target.connectionId)
               .pipe(Effect.orElseSucceed(() => Option.none()));
-            bearerChanged = Option.match(stored, {
+            const changed = Option.match(previousCredential, {
               onNone: () => true,
               onSome: (credential) => credential.token !== registration.credential.token,
             });
-            yield* credentials.put(registration.target.connectionId, registration.credential).pipe(
-              Effect.catch((error) =>
-                Effect.logWarning("Could not store the platform bearer credential.", {
-                  environmentId: target.environmentId,
-                  error,
-                }),
-              ),
-            );
+            const stored = yield* credentials
+              .put(registration.target.connectionId, registration.credential)
+              .pipe(
+                Effect.as(true),
+                Effect.catch((error) =>
+                  Effect.logWarning("Could not store the platform bearer credential.", {
+                    environmentId: target.environmentId,
+                    error,
+                  }).pipe(Effect.as(false)),
+                ),
+              );
+            // Only refresh the live runtime from a credential a reconnect will
+            // also read, or a later attempt would bring the old token back.
+            bearerRefreshed = changed && stored;
           }
 
           if (persistedTarget !== undefined) {
@@ -573,23 +579,32 @@ export const make = Effect.gen(function* () {
 
           const retained = yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
           // A new bearer revokes the previous one server-side, and the
-          // credential is not part of the catalog entry. Swap it into the kept
-          // runtime's HTTP authorization; the open socket stays authorized and
-          // a later reconnect reads the stored credential.
+          // credential is not part of the catalog entry, so the kept runtime
+          // still holds the old token.
           if (
-            bearerChanged &&
+            bearerRefreshed &&
             Option.isSome(retained) &&
             registration._tag === "BearerConnectionRegistration"
           ) {
+            const supervisor = retained.value;
             const token = registration.credential.token;
-            yield* SubscriptionRef.update(
-              retained.value.prepared,
-              Option.map((prepared) =>
-                prepared.httpAuthorization?._tag === "Bearer"
-                  ? { ...prepared, httpAuthorization: { _tag: "Bearer" as const, token } }
-                  : prepared,
-              ),
-            );
+            // The supervisor publishes `prepared` before it reports
+            // "connected", so a connected runtime has no attempt left that could
+            // write the old token back: swap it in place and keep the socket.
+            // Otherwise an attempt may have read the old token already; restart
+            // it so the next one reads the stored credential.
+            if ((yield* SubscriptionRef.get(supervisor.state)).phase === "connected") {
+              yield* SubscriptionRef.update(
+                supervisor.prepared,
+                Option.map((prepared) =>
+                  prepared.httpAuthorization?._tag === "Bearer"
+                    ? { ...prepared, httpAuthorization: { _tag: "Bearer" as const, token } }
+                    : prepared,
+                ),
+              );
+            } else {
+              yield* supervisor.retryNow;
+            }
           }
         }),
       );

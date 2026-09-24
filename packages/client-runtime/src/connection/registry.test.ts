@@ -152,6 +152,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       target: ConnectionTarget,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly initialDisabled?: ReadonlyArray<EnvironmentId>;
+    readonly credentialPutError?: ConnectionTransientError;
   },
 ) {
   const storedTargets = yield* Ref.make(
@@ -329,11 +330,13 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         Effect.map((current) => Option.fromUndefinedOr(current.get(connectionId))),
       ),
     put: (connectionId, credential) =>
-      Ref.update(storedCredentials, (current) => {
-        const next = new Map(current);
-        next.set(connectionId, credential);
-        return next;
-      }),
+      options?.credentialPutError
+        ? Effect.fail(options.credentialPutError)
+        : Ref.update(storedCredentials, (current) => {
+            const next = new Map(current);
+            next.set(connectionId, credential);
+            return next;
+          }),
     remove: (connectionId) =>
       Ref.update(storedCredentials, (current) => {
         const next = new Map(current);
@@ -1466,6 +1469,110 @@ describe("EnvironmentRegistry", () => {
         );
         expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
         expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("restarts an in-flight attempt that read the replaced platform bearer", () =>
+    Effect.gen(function* () {
+      const connects = yield* Ref.make(0);
+      const staleAttemptStarted = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([], [], [], {
+        // Hold the second attempt after it read the old token, like a reconnect
+        // that is still in flight when the new bearer arrives.
+        beforeSessionConnect: () =>
+          Ref.updateAndGet(connects, (count) => count + 1).pipe(
+            Effect.flatMap((count) =>
+              count === 2
+                ? Deferred.succeed(staleAttemptStarted, undefined).pipe(
+                    Effect.andThen(Effect.never),
+                  )
+                : Effect.void,
+            ),
+          ),
+      });
+      const registrationWith = (token: string) =>
+        new BearerConnectionRegistration({
+          target: BEARER_TARGET,
+          profile: BEARER_PROFILE,
+          credential: new BearerConnectionCredential({ token }),
+        });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.reconcilePlatform([registrationWith("first-token")]);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+        yield* registry.retryNow(BEARER_TARGET.environmentId);
+        yield* Deferred.await(staleAttemptStarted);
+
+        yield* registry.reconcilePlatform([registrationWith("second-token")]);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        const prepared = yield* registry.run(
+          BEARER_TARGET.environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+            Effect.flatMap((supervisor) => SubscriptionRef.get(supervisor.prepared)),
+          ),
+        );
+        expect(Option.getOrThrow(prepared).httpAuthorization).toEqual({
+          _tag: "Bearer",
+          token: "second-token",
+        });
+        expect(yield* Ref.get(connects)).toBe(3);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("keeps the live platform bearer when the new one cannot be stored", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(
+        [],
+        [],
+        [[BEARER_TARGET.connectionId, new BearerConnectionCredential({ token: "first-token" })]],
+        {
+          credentialPutError: new ConnectionTransientError({
+            reason: "remote-unavailable",
+            detail: "Credential storage unavailable",
+          }),
+        },
+      );
+      const registrationWith = (token: string) =>
+        new BearerConnectionRegistration({
+          target: BEARER_TARGET,
+          profile: BEARER_PROFILE,
+          credential: new BearerConnectionCredential({ token }),
+        });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.reconcilePlatform([registrationWith("first-token")]);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        yield* registry.reconcilePlatform([registrationWith("second-token")]);
+
+        const prepared = yield* registry.run(
+          BEARER_TARGET.environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+            Effect.flatMap((supervisor) => SubscriptionRef.get(supervisor.prepared)),
+          ),
+        );
+        expect(Option.getOrThrow(prepared).httpAuthorization).toEqual({
+          _tag: "Bearer",
+          token: "first-token",
+        });
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
