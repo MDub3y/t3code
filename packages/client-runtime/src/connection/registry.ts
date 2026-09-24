@@ -531,29 +531,17 @@ export const make = Effect.gen(function* () {
           // on their own loopback origin, so they authenticate with a bearer
           // token instead of the primary's same-origin cookie. Stash it where
           // the resolver's bearer broker looks it up.
-          let bearerRefreshed = false;
+          // The platform re-emits its registrations on every poll, so a failed
+          // write is retried on the next one.
           if (registration._tag === "BearerConnectionRegistration") {
-            const previousCredential = yield* credentials
-              .get(registration.target.connectionId)
-              .pipe(Effect.orElseSucceed(() => Option.none()));
-            const changed = Option.match(previousCredential, {
-              onNone: () => true,
-              onSome: (credential) => credential.token !== registration.credential.token,
-            });
-            const stored = yield* credentials
-              .put(registration.target.connectionId, registration.credential)
-              .pipe(
-                Effect.as(true),
-                Effect.catch((error) =>
-                  Effect.logWarning("Could not store the platform bearer credential.", {
-                    environmentId: target.environmentId,
-                    error,
-                  }).pipe(Effect.as(false)),
-                ),
-              );
-            // Only refresh the live runtime from a credential a reconnect will
-            // also read, or a later attempt would bring the old token back.
-            bearerRefreshed = changed && stored;
+            yield* credentials.put(registration.target.connectionId, registration.credential).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Could not store the platform bearer credential.", {
+                  environmentId: target.environmentId,
+                  error,
+                }),
+              ),
+            );
           }
 
           if (persistedTarget !== undefined) {
@@ -579,31 +567,30 @@ export const make = Effect.gen(function* () {
 
           const retained = yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
           // A new bearer revokes the previous one server-side, and the
-          // credential is not part of the catalog entry, so the kept runtime
-          // still holds the old token.
-          if (
-            bearerRefreshed &&
-            Option.isSome(retained) &&
-            registration._tag === "BearerConnectionRegistration"
-          ) {
+          // credential is not part of the catalog entry, so a kept runtime can
+          // still hold the old token. Reconcile it on every registration rather
+          // than only when the token changes: an attempt that read the old
+          // token before this one arrived can still connect with it, and the
+          // next registration then corrects it. Only a connected runtime is
+          // patched, since an attempt in flight overwrites `prepared` when it
+          // lands; the socket is left open either way.
+          if (Option.isSome(retained) && registration._tag === "BearerConnectionRegistration") {
             const supervisor = retained.value;
             const token = registration.credential.token;
-            // The supervisor publishes `prepared` before it reports
-            // "connected", so a connected runtime has no attempt left that could
-            // write the old token back: swap it in place and keep the socket.
-            // Otherwise an attempt may have read the old token already; restart
-            // it so the next one reads the stored credential.
             if ((yield* SubscriptionRef.get(supervisor.state)).phase === "connected") {
-              yield* SubscriptionRef.update(
-                supervisor.prepared,
-                Option.map((prepared) =>
-                  prepared.httpAuthorization?._tag === "Bearer"
-                    ? { ...prepared, httpAuthorization: { _tag: "Bearer" as const, token } }
-                    : prepared,
-                ),
+              // Publish only a real change; this runs on every platform poll.
+              yield* SubscriptionRef.updateSome(supervisor.prepared, (current) =>
+                Option.isSome(current) &&
+                current.value.httpAuthorization?._tag === "Bearer" &&
+                current.value.httpAuthorization.token !== token
+                  ? Option.some(
+                      Option.some({
+                        ...current.value,
+                        httpAuthorization: { _tag: "Bearer" as const, token },
+                      }),
+                    )
+                  : Option.none(),
               );
-            } else {
-              yield* supervisor.retryNow;
             }
           }
         }),
