@@ -368,10 +368,16 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     connect: (entry, reportProgress) =>
       Effect.gen(function* () {
         const target = entry.target;
-        const prepared = {
+        const credential =
+          target._tag === "BearerConnectionTarget"
+            ? (yield* Ref.get(storedCredentials)).get(target.connectionId)
+            : undefined;
+        const prepared: PreparedConnection = {
           ...PREPARED,
           environmentId: target.environmentId,
           label: target.label,
+          httpAuthorization:
+            credential === undefined ? null : { _tag: "Bearer", token: credential.token },
           target,
         };
         yield* reportProgress({ stage: "preparing" });
@@ -1422,6 +1428,45 @@ describe("EnvironmentRegistry", () => {
         Effect.provideService(GitHubRoutingPermissions, permissions),
         Effect.scoped,
       );
+    }),
+  );
+
+  it.effect("swaps a new platform bearer into the live connection without reconnecting", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([]);
+      const registrationWith = (token: string) =>
+        new BearerConnectionRegistration({
+          target: BEARER_TARGET,
+          profile: BEARER_PROFILE,
+          credential: new BearerConnectionCredential({ token }),
+        });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        const httpAuthorization = registry.run(
+          BEARER_TARGET.environmentId,
+          EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+            Effect.flatMap((supervisor) => SubscriptionRef.get(supervisor.prepared)),
+            Effect.map((prepared) => Option.getOrThrow(prepared).httpAuthorization),
+          ),
+        );
+        yield* registry.reconcilePlatform([registrationWith("first-token")]);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+        expect(yield* httpAuthorization).toEqual({ _tag: "Bearer", token: "first-token" });
+
+        yield* registry.reconcilePlatform([registrationWith("second-token")]);
+
+        expect(yield* httpAuthorization).toEqual({ _tag: "Bearer", token: "second-token" });
+        expect((yield* Ref.get(harness.storedCredentials)).get(BEARER_TARGET.connectionId)).toEqual(
+          new BearerConnectionCredential({ token: "second-token" }),
+        );
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+        expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
 

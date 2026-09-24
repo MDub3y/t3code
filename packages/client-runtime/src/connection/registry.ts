@@ -408,6 +408,8 @@ export const make = Effect.gen(function* () {
     );
   }).pipe(Effect.withSpan("EnvironmentRegistry.start"));
 
+  // Returns the retained supervisor when an equivalent runtime was kept, so
+  // callers can refresh it in place instead of tearing it down.
   const installEntryLocked = Effect.fn("EnvironmentRegistry.installEntryLocked")(function* (
     entry: ConnectionCatalogEntry,
     options?: { readonly retainEquivalentRuntime?: boolean },
@@ -422,7 +424,7 @@ export const make = Effect.gen(function* () {
       existingScope !== undefined &&
       Equal.equals(existingScope.entry, entry)
     ) {
-      return;
+      return Option.some(existingScope.supervisor);
     }
 
     yield* closeServiceScope(target.environmentId);
@@ -432,6 +434,7 @@ export const make = Effect.gen(function* () {
       return next;
     });
     yield* createServiceScope(entry);
+    return Option.none<EnvironmentSupervisor.EnvironmentSupervisor["Service"]>();
   });
 
   const register = Effect.fn("EnvironmentRegistry.register")(function* (
@@ -528,7 +531,15 @@ export const make = Effect.gen(function* () {
           // on their own loopback origin, so they authenticate with a bearer
           // token instead of the primary's same-origin cookie. Stash it where
           // the resolver's bearer broker looks it up.
+          let bearerChanged = false;
           if (registration._tag === "BearerConnectionRegistration") {
+            const stored = yield* credentials
+              .get(registration.target.connectionId)
+              .pipe(Effect.orElseSucceed(() => Option.none()));
+            bearerChanged = Option.match(stored, {
+              onNone: () => true,
+              onSome: (credential) => credential.token !== registration.credential.token,
+            });
             yield* credentials.put(registration.target.connectionId, registration.credential).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Could not store the platform bearer credential.", {
@@ -560,7 +571,26 @@ export const make = Effect.gen(function* () {
             );
           }
 
-          yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
+          const retained = yield* installEntryLocked(entry, { retainEquivalentRuntime: true });
+          // A new bearer revokes the previous one server-side, and the
+          // credential is not part of the catalog entry. Swap it into the kept
+          // runtime's HTTP authorization; the open socket stays authorized and
+          // a later reconnect reads the stored credential.
+          if (
+            bearerChanged &&
+            Option.isSome(retained) &&
+            registration._tag === "BearerConnectionRegistration"
+          ) {
+            const token = registration.credential.token;
+            yield* SubscriptionRef.update(
+              retained.value.prepared,
+              Option.map((prepared) =>
+                prepared.httpAuthorization?._tag === "Bearer"
+                  ? { ...prepared, httpAuthorization: { _tag: "Bearer" as const, token } }
+                  : prepared,
+              ),
+            );
+          }
         }),
       );
     },
