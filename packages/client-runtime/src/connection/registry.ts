@@ -191,6 +191,8 @@ export const make = Effect.gen(function* () {
     ReadonlyMap<EnvironmentId, EnvironmentServiceScope>
   >(new Map());
   const platformEnvironmentIds = yield* Ref.make<ReadonlySet<EnvironmentId>>(new Set());
+  // The platform bearer each blocked runtime was last woken for.
+  const blockedWakeTokens = yield* Ref.make<ReadonlyMap<EnvironmentId, string>>(new Map());
   const persistedTargetsByEnvironment = yield* Ref.make<
     ReadonlyMap<EnvironmentId, ConnectionTarget>
   >(new Map(persistedTargets.map((target) => [target.environmentId, target])));
@@ -533,15 +535,19 @@ export const make = Effect.gen(function* () {
           // the resolver's bearer broker looks it up.
           // The platform re-emits its registrations on every poll, so a failed
           // write is retried on the next one.
+          let bearerStored = false;
           if (registration._tag === "BearerConnectionRegistration") {
-            yield* credentials.put(registration.target.connectionId, registration.credential).pipe(
-              Effect.catch((error) =>
-                Effect.logWarning("Could not store the platform bearer credential.", {
-                  environmentId: target.environmentId,
-                  error,
-                }),
-              ),
-            );
+            bearerStored = yield* credentials
+              .put(registration.target.connectionId, registration.credential)
+              .pipe(
+                Effect.as(true),
+                Effect.catch((error) =>
+                  Effect.logWarning("Could not store the platform bearer credential.", {
+                    environmentId: target.environmentId,
+                    error,
+                  }).pipe(Effect.as(false)),
+                ),
+              );
           }
 
           if (persistedTarget !== undefined) {
@@ -577,7 +583,8 @@ export const make = Effect.gen(function* () {
           if (Option.isSome(retained) && registration._tag === "BearerConnectionRegistration") {
             const supervisor = retained.value;
             const token = registration.credential.token;
-            if ((yield* SubscriptionRef.get(supervisor.state)).phase === "connected") {
+            const state = yield* SubscriptionRef.get(supervisor.state);
+            if (state.phase === "connected") {
               // Publish only a real change; this runs on every platform poll.
               yield* SubscriptionRef.updateSome(supervisor.prepared, (current) =>
                 Option.isSome(current) &&
@@ -591,6 +598,22 @@ export const make = Effect.gen(function* () {
                     )
                   : Option.none(),
               );
+            } else if (
+              state.phase === "blocked" &&
+              state.lastFailure?.reason === "authentication" &&
+              bearerStored
+            ) {
+              // An attempt rejected for the revoked token parks the runtime
+              // until it is signalled. The next attempt reads the stored
+              // credential, so wake it once per token; a token that is itself
+              // rejected stays blocked instead of retrying every poll.
+              const alreadyWoken = (yield* Ref.get(blockedWakeTokens)).get(target.environmentId);
+              if (alreadyWoken !== token) {
+                yield* Ref.update(blockedWakeTokens, (current) =>
+                  new Map(current).set(target.environmentId, token),
+                );
+                yield* supervisor.retryNow;
+              }
             }
           }
         }),
@@ -623,6 +646,11 @@ export const make = Effect.gen(function* () {
           if (Exit.isFailure(revoked)) return;
           yield* Ref.update(platformEnvironmentIds, (current) => {
             const next = new Set(current);
+            next.delete(environmentId);
+            return next;
+          });
+          yield* Ref.update(blockedWakeTokens, (current) => {
+            const next = new Map(current);
             next.delete(environmentId);
             return next;
           });

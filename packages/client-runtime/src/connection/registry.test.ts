@@ -153,6 +153,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly initialDisabled?: ReadonlyArray<EnvironmentId>;
     readonly credentialPutError?: ConnectionTransientError;
+    /** Bearer tokens the fake environment rejects, as a server does once revoked. */
+    readonly rejectedBearerTokens?: ReadonlySet<string>;
   },
 ) {
   const storedTargets = yield* Ref.make(
@@ -385,6 +387,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         };
         yield* reportProgress({ stage: "preparing" });
         if (options?.prepareError) return yield* options.prepareError;
+        if (credential !== undefined && options?.rejectedBearerTokens?.has(credential.token)) {
+          return yield* new ConnectionBlockedError({
+            reason: "authentication",
+            detail: "The environment rejected the bearer token.",
+          });
+        }
         yield* reportProgress({ stage: "opening", prepared });
         yield* options?.beforeSessionConnect?.(target.environmentId) ?? Effect.void;
         const closed = yield* Deferred.make<never, ConnectionTransientError>();
@@ -1534,6 +1542,46 @@ describe("EnvironmentRegistry", () => {
           token: "second-token",
         });
         expect(yield* Ref.get(connects)).toBe(2);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("wakes a runtime blocked on a revoked platform bearer once the new one is stored", () =>
+    Effect.gen(function* () {
+      const rejectedBearerTokens = new Set<string>();
+      const harness = yield* makeHarness([], [], [], { rejectedBearerTokens });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.reconcilePlatform([bearerRegistration("first-token")]);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        // A reconnect after the server revoked the old bearer is rejected and
+        // parks the runtime.
+        rejectedBearerTokens.add("first-token");
+        yield* registry.retryNow(BEARER_TARGET.environmentId);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "blocked",
+        );
+
+        yield* registry.reconcilePlatform([bearerRegistration("second-token")]);
+        yield* awaitConnectionState(
+          registry,
+          BEARER_TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        expect((yield* bearerPrepared(registry)).httpAuthorization).toEqual({
+          _tag: "Bearer",
+          token: "second-token",
+        });
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(2);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
